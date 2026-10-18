@@ -41,9 +41,9 @@ python example.py
 |---|---|---|
 | Porto | 843,920 trajectories | included in this repository (see `data/`) |
 | Xiamen | 5,471 trajectories | included in this repository |
-| Shanghai | 948,705 trajectories | [Zenodo DOI — to be added] |
+| Shanghai | 948,705 trajectories | **raw data available upon request** (contact: caesar.yin@qq.com) |
 
-All datasets follow the same preprocessed multi-modal format (road-ID sequences, grid-ID sequences, and GPS point features per trajectory).
+All datasets follow the same preprocessed multi-modal format (road-ID sequences, grid-ID sequences, and GPS point features per trajectory). The Shanghai dataset is shared as **raw data only** and requires access approval; once approved, preprocess it with the released preprocessing configuration.
 
 ## Citation
 
