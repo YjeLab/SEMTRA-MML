@@ -43,7 +43,12 @@ python example.py
 | Xiamen | 5,471 trajectories | included in this repository |
 | Shanghai | 948,705 trajectories | **raw data available upon request** (contact: caesar.yin@qq.com) |
 
-All datasets follow the same preprocessed multi-modal format (road-ID sequences, grid-ID sequences, and GPS point features per trajectory). The Shanghai dataset is shared as **raw data only** and requires access approval; once approved, preprocess it with the released preprocessing configuration.
+All datasets follow the same preprocessed multi-modal format (road-ID sequences, grid-ID sequences, and GPS point features per trajectory).
+
+How to obtain each dataset:
+
+- **Porto / Xiamen** — released directly in this repository under `data/` (see `data/README.md` for the layout).
+- **Shanghai** — shared as **raw data only** under an access-approval policy. To request it, e-mail caesar.yin@qq.com with a short description of your intended use; once approved, preprocess the raw files with the configuration described in the paper.
 
 ## Citation
 
