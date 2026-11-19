@@ -4,86 +4,7 @@ import torch.nn.functional as F
 import math
 import numpy as np
 import random
-# --- PyG 占位符 ---
-try:
-    from torch_geometric.nn import GATConv
-except ImportError:
-    print("警告: 未找到 PyTorch Geometric。将使用一个简化的占位符代替GATConv。")
-    class GATConv(nn.Module):
-        def __init__(self, in_channels, out_channels, heads=1, dropout=0.0, concat=True):
-            super().__init__()
-            self.linear = nn.Linear(in_channels, out_channels * heads)
-        def forward(self, x, edge_index):
-            return self.linear(x)
 
-# ============================= 1. 辅助模块 =======================================
-# --- GAT预训练相关模块 ---
-class RoadEmbeddingGenerator(nn.Module):
-    """
-    使用GAT从道路图的节点特征生成道路嵌入。
-    """
-    def __init__(self, in_features, embedding_dim, n_heads=4, n_layers=2, dropout=0.1):
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        # 特征投影层
-        self.feature_projection = nn.Sequential(
-            nn.Linear(in_features, embedding_dim), 
-            nn.ReLU(inplace=True), 
-            nn.LayerNorm(embedding_dim)
-        )
-        # GAT层列表
-        self.gat_layers = nn.ModuleList(
-            [GATConv(embedding_dim, embedding_dim, heads=n_heads, dropout=dropout, concat=False) for _ in range(n_layers)]
-        )
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(embedding_dim)
-
-    def forward(self, x_feat, edge_index):
-        # 初始投影
-        road_embeddings = self.feature_projection(x_feat)
-        # 通过多层GAT
-        for gat_layer in self.gat_layers:
-            identity = road_embeddings
-            road_embeddings = gat_layer(road_embeddings, edge_index)
-            road_embeddings = self.dropout(road_embeddings)
-            road_embeddings = self.layer_norm(road_embeddings + identity) # 残差连接
-            road_embeddings = F.relu(road_embeddings)
-        return road_embeddings
-
-class StagedGAT(nn.Module):
-    """
-    用于分阶段训练的 GAT 模型，专为链接预测预训练任务设计。
-    """
-    def __init__(self, in_features, embedding_dim, n_heads=4, n_layers=2, dropout=0.1):
-        super().__init__()
-        # 核心的GAT模块，用于生成嵌入
-        self.gat = RoadEmbeddingGenerator(in_features, embedding_dim, n_heads, n_layers, dropout)
-        
-        # 链接预测的分类器：接收两条道路嵌入的拼接，输出一个logit
-        self.link_predictor = nn.Sequential(
-            nn.Linear(embedding_dim * 2, embedding_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(embedding_dim, 1)
-        )
-
-    def forward(self, x_feat, edge_index):
-        """只做 GAT 的前向传播，生成嵌入。"""
-        return self.gat(x_feat, edge_index)
-    
-    def predict_links(self, road_embeddings, edge_indices_to_predict):
-        """根据生成的嵌入来预测边的存在。"""
-        # 从嵌入矩阵中取出对应边的起点和终点嵌入
-        start_nodes_embeds = road_embeddings[edge_indices_to_predict[0]]
-        end_nodes_embeds = road_embeddings[edge_indices_to_predict[1]]
-        
-        # 将起点和终点嵌入拼接起来
-        edge_embeds = torch.cat([start_nodes_embeds, end_nodes_embeds], dim=1)
-        
-        # 通过分类器得到预测logit
-        logits = self.link_predictor(edge_embeds)
-        return logits.squeeze(-1)
-    
 class GridEmbedding(nn.Module):
     """使用CNN从城市栅格特征图中预计算嵌入，并提供批量查询功能。"""
     def __init__(self, in_channels, embedding_dim, grid_map_shape, pad_token_id):
@@ -386,32 +307,26 @@ class SEMTRA_MML(nn.Module):
     运动语义增强的多模态轨迹学习框架。
     - 双流架构: (Road+GPS)流 和 Grid流
     - 运动语义锚点: 通过交叉注意力注入运动先验知识
-    - 自监督损失: 拉近模态间表示的相关性，优化运动语义损失
     """
     def __init__(self, num_roads, num_grids, grid_map_shape, grid_channels, 
                  embedding_dim, nhead_tf, num_shallow_layers, num_deep_layers,    
                  dim_feedforward_tf, num_classes, dropout=0.1, max_len=1000,device=None,pre_flag=False,
-                 motion_version='v2', motion_feature_dim=40, num_motion_anchors=12, lambda_motion=0.1,
-                 residual_scale_init=1e-3, motion_supervision='full',
+                 motion_version='v2', motion_feature_dim=40, num_motion_anchors=12,
+                 residual_scale_init=1e-3,
                  injection_scale_init=1.0, injection_mode='all',
-                 motion_injection_mode='geo', anchor_structure_weight=0.0,
+                 motion_injection_mode='geo',
                  perturb_structure_target='none'):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.motion_version = motion_version
-        self.lambda_motion = lambda_motion
-        self.motion_supervision = motion_supervision
         self.motion_injection_mode = motion_injection_mode
-        self.anchor_structure_weight = anchor_structure_weight
         self.perturb_structure_target = perturb_structure_target
-        self.motion_loss_scale = 1.0
         # --- 1. 初始化各模态的嵌入层 ---
         # --- 【关键修正】在这里为错误的 pad_token 留出冗余空间 ---
         self.num_roads = num_roads
         self.unk_token_id = num_roads
         self.cls_token_id = num_roads + 1
         self.pad_token_id = num_roads + 2  # 这是我们【期望】的正确pad token
-        self.mask_token_id = num_roads + 3
         
         # 旧的 vocab_size 是 num_roads + 4，最大有效索引是 num_roads + 3
         # 错误的 pad_token 会产生 num_roads + 3 + 1 = num_roads + 4 的索引
@@ -551,14 +466,7 @@ class SEMTRA_MML(nn.Module):
         self.fusion_projector = nn.Sequential(nn.Linear(embedding_dim * 2, embedding_dim), nn.LayerNorm(embedding_dim), nn.ReLU(inplace=True), nn.Dropout(dropout))
         self.time_head = nn.Sequential(nn.Linear(embedding_dim, 1))
         self.class_head = nn.Linear(embedding_dim, num_classes) if num_classes > 0 else None
-        
-        # --- 预训练任务模块 ---
-        if pre_flag:
-            self.temperature = nn.Parameter(torch.tensor(0.07))
-            # 为MLM融合创建一个独立的交叉注意力实例
-            self.mlm_fusion_attn = CrossAttentionLayer(embedding_dim, nhead_tf, dropout)
-            self.mlm_classification_head = nn.Linear(embedding_dim, self.road_vocab_size)
-        
+
     def _create_target_similarity_matrix(self):
         """辅助函数，用于创建我们理想中的语义相似度矩阵。"""
         words = self.motion_words
@@ -592,62 +500,6 @@ class SEMTRA_MML(nn.Module):
                 
         return target_matrix
     
-    def _apply_span_mask(self, token_ids, pad_mask):
-        """
-        在模型内部对一个批次的token_ids进行连续段落掩码。
-        pad_mask: [B, L], True表示填充位置。
-        """
-        # clone 输入以避免原地修改
-        masked_token_ids = token_ids.clone()
-        labels = torch.full_like(token_ids, -100) # 初始化标签为-100
-
-        for i in range(token_ids.size(0)): # 遍历batch中的每个样本
-            # 找到非填充部分的有效长度 (不包括[CLS])
-            # 我们假设[CLS]总是在第一个位置
-            seq_len = (~pad_mask[i, 1:]).sum().item()
-            if seq_len < 3: continue # 序列太短，不进行掩码
-            
-            num_to_mask = int(math.ceil(seq_len * 0.15))
-            if num_to_mask == 0: continue
-
-            # 使用几何分布确定掩码段长度
-            span_lengths = np.random.geometric(p=0.2, size=num_to_mask)
-            
-            masked_indices = set()
-            attempts = 0
-            # 增加尝试次数以确保能尽可能多地掩码
-            while len(masked_indices) < num_to_mask and attempts < 100:
-                # 随机选择一个掩码段的长度
-                span_len = min(np.random.choice(span_lengths), seq_len - len(masked_indices))
-                if span_len == 0:
-                    attempts += 1
-                    continue
-                
-                # 随机选择一个起始位置（在有效长度内，即1到seq_len）
-                start_idx = random.randint(1, seq_len - span_len + 1)
-
-                # 检查这个区域是否与已有的掩码区域重叠
-                is_valid_span = True
-                for j in range(span_len):
-                    if (start_idx + j) in masked_indices:
-                        is_valid_span = False
-                        break
-                
-                if is_valid_span:
-                    for j in range(span_len):
-                        idx = start_idx + j
-                        if len(masked_indices) < num_to_mask:
-                            masked_indices.add(idx)
-                attempts += 1
-            
-            # 应用掩码
-            for idx in masked_indices:
-                # labels的索引与token_ids完全一致
-                labels[i, idx] = masked_token_ids[i, idx]
-                masked_token_ids[i, idx] = self.mask_token_id
-
-        return masked_token_ids, labels
-        
     def load_static_road_embeddings(self, path, freeze=False):
         print(f"正在加载静态道路嵌入: {path}...")
         embeds = torch.load(path, map_location='cpu')
@@ -666,10 +518,7 @@ class SEMTRA_MML(nn.Module):
     def forward(self, road_indices, road_mask, grid_indices, grid_mask, gps_points, gps_mask,
                 task='classification', mtm_labels=None, motion_features=None, motion_labels=None,
                 collect_attention=False):
-        
-        if task == 'pretrain':
-            road_indices, mtm_labels = self._apply_span_mask(road_indices, road_mask)
-            
+
         road_embed, grid_embed, gps_embed = self.road_embedding_layer(road_indices), self.grid_embedding_layer(grid_indices), self.gps_embedding_layer(gps_points)
         road_gps_fused_embed = self.road_gps_fusion_layer(torch.cat([road_embed, gps_embed], dim=-1))
         road_gps_embed_pos, grid_embed_pos = self.pos_encoder(road_gps_fused_embed), self.pos_encoder(grid_embed)
@@ -727,103 +576,12 @@ class SEMTRA_MML(nn.Module):
         road_gps_deep_out = self.road_gps_encoder_deep(road_gps_motion_fused, src_key_padding_mask=road_mask)
         grid_deep_out = self.grid_encoder_deep(grid_motion_fused, src_key_padding_mask=grid_mask)
         
-        if task == 'pretrain':
-            # 1. 对比损失
-            road_gps_cls = F.normalize(road_gps_deep_out[:, 0], p=2, dim=1)
-            grid_cls = F.normalize(grid_deep_out[:, 0], p=2, dim=1)
-            logits = torch.matmul(road_gps_cls, grid_cls.T) / self.temperature
-            labels = torch.arange(logits.size(0)).to(logits.device)
-            loss_cl = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
-
-            # 2. MLM损失
-            fused_sequence_for_mlm = self.mlm_fusion_attn(road_gps_deep_out, grid_deep_out, grid_deep_out, key_padding_mask=grid_mask)
-            masked_positions = (mtm_labels != -100)
-            if not masked_positions.any():
-                loss_mlm = torch.tensor(0.0, device=loss_cl.device)
-            else:
-                masked_output = fused_sequence_for_mlm[masked_positions]
-                prediction_logits = self.mlm_classification_head(masked_output)
-                true_labels = mtm_labels[masked_positions]
-                loss_mlm = F.cross_entropy(prediction_logits, true_labels)
-            
-            return loss_cl, loss_mlm
-            
-        else: # 下游任务
-            road_gps_cls, grid_cls = road_gps_deep_out[:, 0], grid_deep_out[:, 0]
-            loss_ssl = None
-            if self.training:
-                loss_align = 1 - F.cosine_similarity(road_gps_cls, grid_cls, dim=-1).mean()
-                if self.motion_version in ('v3', 'v4', 'v5'):
-                    loss_ssl = loss_align
-                    if road_gps_motion_weights is not None and motion_labels is not None and self.motion_supervision != 'none':
-                        logits = self.last_motion_assignment_logits
-                        # Direction anchors are mutually exclusive, so use CE.
-                        dir_logits = logits[..., :4]
-                        dir_labels = motion_labels[..., :4]
-                        dir_mask = dir_labels.sum(dim=-1) > 0
-                        if dir_mask.any():
-                            dir_target = dir_labels[dir_mask].argmax(dim=-1)
-                            loss_direction = F.cross_entropy(dir_logits[dir_mask], dir_target)
-                        else:
-                            loss_direction = torch.tensor(0.0, device=logits.device)
-
-                        if self.motion_supervision == 'direction':
-                            loss_motion = loss_direction
-                        else:
-                            # Context anchors are multi-label, so use weighted BCE.
-                            # 空选择保护:某批可能没有任何上下文正例,
-                            # 空 tensor 的 BCE 会返回 NaN 并毒化训练。
-                            ctx_logits = logits[..., 4:]
-                            ctx_labels = motion_labels[..., 4:]
-                            ctx_mask = motion_labels.sum(dim=-1) > 0
-                            selected_ctx_logits = ctx_logits[ctx_mask]
-                            selected_ctx_labels = ctx_labels[ctx_mask]
-                            if selected_ctx_logits.numel() == 0:
-                                loss_motion = loss_direction
-                            else:
-                                positive = selected_ctx_labels.sum(dim=0)
-                                negative = selected_ctx_labels.numel() - positive
-                                pos_weight = (negative / positive.clamp(min=1.0)).clamp(1.0, 20.0)
-                                loss_context = F.binary_cross_entropy_with_logits(
-                                    selected_ctx_logits,
-                                    selected_ctx_labels,
-                                    pos_weight=pos_weight,
-                                    reduction='mean'
-                                )
-                                loss_motion = loss_direction + loss_context
-                        loss_scale = getattr(self, 'motion_loss_scale', 1.0)
-                        loss_ssl = loss_ssl + loss_scale * self.lambda_motion * loss_motion
-                    # Anchor diversity keeps the stable injection branch from
-                    # collapsing while grouped anchors remain semantically
-                    # distinguishable for probing.
-                    structure_weight = getattr(self, 'anchor_structure_weight', 0.0)
-                    if structure_weight > 0:
-                        if getattr(self, 'motion_injection_mode', 'geo') == 'v2_anchor':
-                            anchors_norm = F.normalize(
-                                self.injection_anchor_embeddings, p=2, dim=1
-                            )
-                            target_sim = self.injection_target_similarity_matrix
-                        else:
-                            anchors_norm = F.normalize(
-                                self.motion_anchor_embeddings, p=2, dim=1
-                            )
-                            target_sim = self.target_similarity_matrix
-                        actual_sim = torch.matmul(anchors_norm, anchors_norm.t())
-                        loss_ssl = loss_ssl + structure_weight * F.mse_loss(
-                            actual_sim, target_sim
-                        )
-                else:
-                    anchors_norm = F.normalize(self.motion_anchor_embeddings, p=2, dim=1)
-                    actual_sim = torch.matmul(anchors_norm, anchors_norm.t())
-                    loss_structure = F.mse_loss(actual_sim, self.target_similarity_matrix)
-                    lambda_structure = 0.1
-                    loss_ssl = loss_align + lambda_structure * loss_structure
-            
-            fused_representation = self.fusion_projector(torch.cat([road_gps_cls, grid_cls], dim=1))
-            
-            if task == 'classification': output = self.class_head(fused_representation)
-            elif task == 'regression': output = self.time_head(fused_representation).squeeze(-1)
-            else: raise ValueError(f"未知的下游任务: {task}")
-            
-            return (output, loss_ssl) if self.training else output
+        road_gps_cls, grid_cls = road_gps_deep_out[:, 0], grid_deep_out[:, 0]
+        fused_representation = self.fusion_projector(torch.cat([road_gps_cls, grid_cls], dim=1))
+        
+        if task == 'classification': output = self.class_head(fused_representation)
+        elif task == 'regression': output = self.time_head(fused_representation).squeeze(-1)
+        else: raise ValueError(f"未知的下游任务: {task}")
+        
+        return output
 

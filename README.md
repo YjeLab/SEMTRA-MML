@@ -10,8 +10,7 @@ SEMTRA-MML is a dual-stream hierarchical framework for trajectory representation
 
 - **Multi-modal embedding**: road-segment embeddings (GAT-pretrained), per-point GPS dynamics embeddings (longitude/latitude/heading, no time-derived kinematics), and CNN-based grid embeddings.
 - **Dual-stream hierarchical encoder**: shallow encoder → motion semantics enhancement (anchor cross-attention) → deep encoder, for each stream.
-- **Supervised semantic anchoring**: every anchor is tied to a rule-defined concept whose occurrences are verifiable on the map; a quality gate (linear-probe AUC ≥ 0.8) admits only reliable concepts.
-- **Objectives**: `L_total = L_main + α (L_align + λ_struct · L_struct + λ_sem · L_sem)`.
+- **Supervised semantic anchoring**: every anchor is tied to a rule-defined concept whose occurrences are verifiable on the map.
 
 ## Repository layout
 

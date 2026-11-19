@@ -15,8 +15,7 @@ def main():
         grid_map_shape=(89, 156), grid_channels=3,
         num_classes=0, pre_flag=False, device=device,
         motion_version="v5", motion_feature_dim=64, num_motion_anchors=12,
-        lambda_motion=0.1, motion_supervision="full",
-        motion_injection_mode="anchor", anchor_structure_weight=0.1,
+        motion_injection_mode="anchor",
         injection_mode="all", injection_scale_init=1.0,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
